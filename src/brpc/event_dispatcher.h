@@ -170,7 +170,7 @@ private:
         return OnEvent<false>(event_data_id, events, thread_attr);
     }
 
-    // The epoll/kqueue fd to watch events.
+    // The epoll/kqueue/io_uring fd to watch events.
     int _event_dispatcher_fd;
 
     // false unless Stop() is called.
@@ -184,6 +184,9 @@ private:
 
     // Pipe fds to wakeup EventDispatcher from `epoll_wait' in order to quit
     int _wakeup_fds[2];
+
+    // io_uring context (only used when io_uring is enabled)
+    void* _io_uring_ctx = NULL;
 };
 
 EventDispatcher& GetGlobalEventDispatcher(int fd, bthread_tag_t tag);

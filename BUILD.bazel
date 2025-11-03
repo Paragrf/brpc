@@ -57,6 +57,9 @@ COPTS = [
 }) + select({
     "//bazel/config:brpc_with_no_pthread_mutex_hook": ["-DNO_PTHREAD_MUTEX_HOOK"],
     "//conditions:default": [""],
+}) + select({
+    "//bazel/config:brpc_enable_io_uring": ["-DBRPC_ENABLE_IO_URING=1"],
+    "//conditions:default": [""],
 })
 
 LINKOPTS = [
@@ -89,6 +92,11 @@ LINKOPTS = [
 }) + select({
     "//bazel/config:brpc_with_rdma": [
         "-libverbs",
+    ],
+    "//conditions:default": [],
+}) + select({
+    "//bazel/config:brpc_enable_io_uring": [
+        "-luring",
     ],
     "//conditions:default": [],
 }) + select({
@@ -541,6 +549,7 @@ cc_library(
         "src/brpc/policy/thrift_protocol.cpp",
         "src/brpc/event_dispatcher_epoll.cpp",
         "src/brpc/event_dispatcher_kqueue.cpp",
+        "src/brpc/event_dispatcher_iouring.cpp",
     ]) + select({
         "//bazel/config:brpc_with_thrift": glob([
             "src/brpc/thrift*.cpp",
@@ -553,6 +562,7 @@ cc_library(
         "src/brpc/**/*.h",
         "src/brpc/event_dispatcher_epoll.cpp",
         "src/brpc/event_dispatcher_kqueue.cpp",
+        "src/brpc/event_dispatcher_iouring.cpp",
     ]),
     copts = COPTS,
     includes = [

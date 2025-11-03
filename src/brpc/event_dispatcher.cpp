@@ -36,6 +36,11 @@ DEFINE_bool(usercode_in_pthread, false,
 DEFINE_bool(usercode_in_coroutine, false,
             "User's callback are run in coroutine, no bthread or pthread blocking call");
 
+#if defined(OS_LINUX)
+DEFINE_bool(use_iouring, false,
+            "Use io_uring for event dispatching instead of epoll (requires kernel >= 5.10)");
+#endif
+
 static EventDispatcher* g_edisp = NULL;
 static bvar::LatencyRecorder* g_edisp_read_lantency = NULL;
 static bvar::LatencyRecorder* g_edisp_write_lantency = NULL;
@@ -100,7 +105,13 @@ void IOEventData::BeforeRecycled() {
 } // namespace brpc
 
 #if defined(OS_LINUX)
-    #include "brpc/event_dispatcher_epoll.cpp"
+    #ifdef BRPC_ENABLE_IO_URING
+        // Use io_uring implementation when enabled at runtime via FLAGS_use_iouring
+        // The io_uring implementation includes its own availability check
+        #include "brpc/event_dispatcher_iouring.cpp"
+    #else
+        #include "brpc/event_dispatcher_epoll.cpp"
+    #endif
 #elif defined(OS_MACOSX)
     #include "brpc/event_dispatcher_kqueue.cpp"
 #else
