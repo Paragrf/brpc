@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#include <map>
+#include <unordered_map>
 #include "butil/fd_utility.h"
 #include "butil/logging.h"
 
@@ -54,10 +54,19 @@ struct IOUringContext {
     struct io_uring ring;
     
     // Track file descriptors and their associated event data
-    // Key: fd, Value: IOEventDataId
-    std::map<int, IOEventDataId> fd_map;
+    // Use unordered_map for O(1) lookup instead of O(log n)
+    std::unordered_map<int, IOEventDataId> fd_map;
     
-    IOUringContext() {}
+    // Reverse mapping: event_data_id -> fd (for fast fd lookup)
+    std::unordered_map<IOEventDataId, int> event_to_fd_map;
+    
+    // Track poll masks for re-arming
+    std::unordered_map<int, uint32_t> poll_mask_map;
+    
+    // Counter for pending submissions (for batch optimization)
+    int pending_submissions;
+    
+    IOUringContext() : pending_submissions(0) {}
     ~IOUringContext() {}
 };
 
@@ -172,6 +181,39 @@ void EventDispatcher::Join() {
     }
 }
 
+// Helper function to get SQE with auto-submit on queue full
+static struct io_uring_sqe* get_sqe_with_retry(IOUringContext* ctx) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ctx->ring);
+    if (!sqe) {
+        // Submission queue is full, submit pending operations first
+        int ret = io_uring_submit(&ctx->ring);
+        if (ret < 0) {
+            PLOG(ERROR) << "Failed to submit on SQ full";
+            return NULL;
+        }
+        ctx->pending_submissions = 0;
+        
+        // Try again
+        sqe = io_uring_get_sqe(&ctx->ring);
+    }
+    return sqe;
+}
+
+// Helper function to conditionally submit based on pending count
+static void maybe_submit(IOUringContext* ctx, bool force = false) {
+    const int BATCH_THRESHOLD = 8;  // Submit when we have 8+ pending operations
+    
+    // Always submit if there are pending operations and force=true
+    // Or submit when threshold is reached
+    if (ctx->pending_submissions > 0 && 
+        (force || ctx->pending_submissions >= BATCH_THRESHOLD)) {
+        int ret = io_uring_submit(&ctx->ring);
+        if (ret >= 0) {
+            ctx->pending_submissions = 0;
+        }
+    }
+}
+
 int EventDispatcher::RegisterEvent(IOEventDataId event_data_id,
                                    int fd, bool pollin) {
     if (_event_dispatcher_fd < 0) {
@@ -181,8 +223,8 @@ int EventDispatcher::RegisterEvent(IOEventDataId event_data_id,
     
     IOUringContext* ctx = static_cast<IOUringContext*>(_io_uring_ctx);
     
-    // Get a submission queue entry
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ctx->ring);
+    // Get a submission queue entry (with auto-retry on full)
+    struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
     if (!sqe) {
         errno = ENOMEM;
         LOG(ERROR) << "Failed to get SQE for fd=" << fd;
@@ -198,15 +240,17 @@ int EventDispatcher::RegisterEvent(IOEventDataId event_data_id,
     io_uring_prep_poll_add(sqe, fd, poll_mask);
     io_uring_sqe_set_data(sqe, (void*)(uintptr_t)event_data_id);
     
-    // Track this fd
+    // Track this fd and its poll mask (with reverse mapping)
     ctx->fd_map[fd] = event_data_id;
+    ctx->event_to_fd_map[event_data_id] = fd;
+    ctx->poll_mask_map[fd] = poll_mask;
+    ctx->pending_submissions++;
     
-    // Submit the operation
-    int ret = io_uring_submit(&ctx->ring);
-    if (ret < 0) {
-        PLOG(ERROR) << "Failed to submit poll add for fd=" << fd;
-        return -1;
-    }
+    // Batch submit - only submit when threshold reached
+    // If threshold not reached, operations will be submitted:
+    //   1. When next batch threshold is reached
+    //   2. In Run() loop on each iteration (ensures no indefinite delay)
+    maybe_submit(ctx, false);
     
     return 0;
 }
@@ -222,7 +266,7 @@ int EventDispatcher::UnregisterEvent(IOEventDataId event_data_id,
     
     if (pollin) {
         // Re-register with only POLLIN
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ctx->ring);
+        struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
         if (!sqe) {
             errno = ENOMEM;
             return -1;
@@ -231,15 +275,15 @@ int EventDispatcher::UnregisterEvent(IOEventDataId event_data_id,
         io_uring_prep_poll_add(sqe, fd, POLLIN);
         io_uring_sqe_set_data(sqe, (void*)(uintptr_t)event_data_id);
         
-        int ret = io_uring_submit(&ctx->ring);
-        if (ret < 0) {
-            PLOG(ERROR) << "Failed to re-submit poll for fd=" << fd;
-            return -1;
-        }
+        // Update poll mask
+        ctx->poll_mask_map[fd] = POLLIN;
+        ctx->pending_submissions++;
+        
+        maybe_submit(ctx, false);
         return 0;
     } else {
         // Remove poll entirely
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ctx->ring);
+        struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
         if (!sqe) {
             errno = ENOMEM;
             return -1;
@@ -248,14 +292,13 @@ int EventDispatcher::UnregisterEvent(IOEventDataId event_data_id,
         // Use poll remove operation
         io_uring_prep_poll_remove(sqe, (void*)(uintptr_t)event_data_id);
         
-        // Remove from tracking
+        // Remove from tracking (including reverse mapping)
+        ctx->event_to_fd_map.erase(event_data_id);
         ctx->fd_map.erase(fd);
+        ctx->poll_mask_map.erase(fd);
+        ctx->pending_submissions++;
         
-        int ret = io_uring_submit(&ctx->ring);
-        if (ret < 0) {
-            PLOG(ERROR) << "Failed to submit poll remove for fd=" << fd;
-            return -1;
-        }
+        maybe_submit(ctx, false);
         return 0;
     }
 }
@@ -268,7 +311,7 @@ int EventDispatcher::AddConsumer(IOEventDataId event_data_id, int fd) {
     
     IOUringContext* ctx = static_cast<IOUringContext*>(_io_uring_ctx);
     
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ctx->ring);
+    struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
     if (!sqe) {
         errno = ENOMEM;
         LOG(ERROR) << "Failed to get SQE for fd=" << fd;
@@ -279,14 +322,13 @@ int EventDispatcher::AddConsumer(IOEventDataId event_data_id, int fd) {
     io_uring_prep_poll_add(sqe, fd, POLLIN);
     io_uring_sqe_set_data(sqe, (void*)(uintptr_t)event_data_id);
     
-    // Track this fd
+    // Track this fd (with reverse mapping)
     ctx->fd_map[fd] = event_data_id;
+    ctx->event_to_fd_map[event_data_id] = fd;
+    ctx->poll_mask_map[fd] = POLLIN;
+    ctx->pending_submissions++;
     
-    int ret = io_uring_submit(&ctx->ring);
-    if (ret < 0) {
-        PLOG(ERROR) << "Failed to submit poll add for fd=" << fd;
-        return -1;
-    }
+    maybe_submit(ctx, false);
     
     return 0;
 }
@@ -307,7 +349,7 @@ int EventDispatcher::RemoveConsumer(int fd) {
     
     IOEventDataId event_data_id = it->second;
     
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ctx->ring);
+    struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
     if (!sqe) {
         errno = ENOMEM;
         return -1;
@@ -316,14 +358,13 @@ int EventDispatcher::RemoveConsumer(int fd) {
     // Remove poll
     io_uring_prep_poll_remove(sqe, (void*)(uintptr_t)event_data_id);
     
-    // Remove from tracking
+    // Remove from tracking (including reverse mapping)
+    ctx->event_to_fd_map.erase(event_data_id);
     ctx->fd_map.erase(it);
+    ctx->poll_mask_map.erase(fd);
+    ctx->pending_submissions++;
     
-    int ret = io_uring_submit(&ctx->ring);
-    if (ret < 0) {
-        PLOG(WARNING) << "Failed to submit poll remove for fd=" << fd;
-        // Don't return error as the fd might already be closed
-    }
+    maybe_submit(ctx, false);
     
     return 0;
 }
@@ -331,6 +372,25 @@ int EventDispatcher::RemoveConsumer(int fd) {
 void* EventDispatcher::RunThis(void* arg) {
     ((EventDispatcher*)arg)->Run();
     return NULL;
+}
+
+// Helper function to re-arm a poll operation
+static void rearm_poll(IOUringContext* ctx, int fd, IOEventDataId event_data_id, uint32_t poll_mask) {
+    struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
+    if (sqe) {
+        io_uring_prep_poll_add(sqe, fd, poll_mask);
+        io_uring_sqe_set_data(sqe, (void*)(uintptr_t)event_data_id);
+        ctx->pending_submissions++;
+    }
+}
+
+// Helper function to find fd by event_data_id (O(1) with reverse mapping)
+static int find_fd_by_event_data_id(IOUringContext* ctx, IOEventDataId event_data_id) {
+    auto it = ctx->event_to_fd_map.find(event_data_id);
+    if (it != ctx->event_to_fd_map.end()) {
+        return it->second;
+    }
+    return -1;
 }
 
 void EventDispatcher::Run() {
@@ -342,100 +402,136 @@ void EventDispatcher::Run() {
         io_uring_prep_poll_add(sqe, _wakeup_fds[0], POLLIN);
         io_uring_sqe_set_data(sqe, NULL); // NULL indicates wakeup fd
         io_uring_submit(&ctx->ring);
+        ctx->pending_submissions = 0;
     }
     
+    const int BATCH_SIZE = 32;
+    struct io_uring_cqe* cqes[BATCH_SIZE];
+    
     while (!_stop) {
+        // Try to peek multiple CQEs at once (batch processing)
+        unsigned head;
+        unsigned count = 0;
         struct io_uring_cqe* cqe;
         
-        // Wait for completion event
-        int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
-        
-        if (_stop) {
-            break;
+        // First, try to get multiple completions without waiting
+        io_uring_for_each_cqe(&ctx->ring, head, cqe) {
+            cqes[count++] = cqe;
+            if (count >= BATCH_SIZE) {
+                break;
+            }
         }
         
-        if (ret < 0) {
-            if (ret == -EINTR) {
+        if (count == 0) {
+            // No events ready, wait for at least one
+            int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
+            
+            if (_stop) {
+                break;
+            }
+            
+            if (ret < 0) {
+                if (ret == -EINTR) {
+                    continue;
+                }
+                PLOG(ERROR) << "io_uring_wait_cqe failed";
+                break;
+            }
+            
+            if (!cqe) {
                 continue;
             }
-            PLOG(ERROR) << "io_uring_wait_cqe failed";
-            break;
-        }
-        
-        if (!cqe) {
-            continue;
-        }
-        
-        // Get user data
-        void* user_data = io_uring_cqe_get_data(cqe);
-        int32_t res = cqe->res;
-        
-        // Mark CQE as seen
-        io_uring_cqe_seen(&ctx->ring, cqe);
-        
-        // Check if this is the wakeup fd
-        if (user_data == NULL) {
-            // Consume wakeup data
-            char dummy[64];
-            ssize_t n = read(_wakeup_fds[0], dummy, sizeof(dummy));
-            (void)n;
             
-            // Re-arm wakeup fd if not stopping
-            if (!_stop) {
-                sqe = io_uring_get_sqe(&ctx->ring);
-                if (sqe) {
-                    io_uring_prep_poll_add(sqe, _wakeup_fds[0], POLLIN);
-                    io_uring_sqe_set_data(sqe, NULL);
-                    io_uring_submit(&ctx->ring);
+            cqes[0] = cqe;
+            count = 1;
+        }
+        
+        // Process all available completions in batch
+        for (unsigned i = 0; i < count; i++) {
+            cqe = cqes[i];
+            void* user_data = io_uring_cqe_get_data(cqe);
+            int32_t res = cqe->res;
+            
+            // Check if this is the wakeup fd
+            if (user_data == NULL) {
+                // Consume wakeup data
+                char dummy[64];
+                ssize_t n = read(_wakeup_fds[0], dummy, sizeof(dummy));
+                (void)n;
+                
+                // Re-arm wakeup fd if not stopping
+                if (!_stop) {
+                    sqe = get_sqe_with_retry(ctx);
+                    if (sqe) {
+                        io_uring_prep_poll_add(sqe, _wakeup_fds[0], POLLIN);
+                        io_uring_sqe_set_data(sqe, NULL);
+                        ctx->pending_submissions++;
+                    }
+                }
+                continue;
+            }
+            
+            // Handle I/O event
+            if (res < 0) {
+                // Error occurred
+                if (res != -ECANCELED) {
+                    VLOG(1) << "io_uring poll returned error: " << strerror(-res);
+                }
+                continue;
+            }
+            
+            IOEventDataId event_data_id = (IOEventDataId)(uintptr_t)user_data;
+            uint32_t revents = res;
+            
+            // Find the fd for this event (needed for re-arming)
+            int fd = find_fd_by_event_data_id(ctx, event_data_id);
+            
+            // Convert poll events to epoll-style events
+            uint32_t events = 0;
+            if (revents & POLLIN) {
+                events |= EPOLLIN;
+            }
+            if (revents & POLLOUT) {
+                events |= EPOLLOUT;
+            }
+            if (revents & POLLERR) {
+                events |= EPOLLERR;
+            }
+            if (revents & POLLHUP) {
+                events |= EPOLLHUP;
+            }
+            
+            // Call input callback if readable
+            if (events & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
+                int64_t start_ns = butil::cpuwide_time_ns();
+                CallInputEventCallback(event_data_id, events, _thread_attr);
+                (*g_edisp_read_lantency) << (butil::cpuwide_time_ns() - start_ns);
+            }
+            
+            // Call output callback if writable
+            if (events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                int64_t start_ns = butil::cpuwide_time_ns();
+                CallOutputEventCallback(event_data_id, events, _thread_attr);
+                (*g_edisp_write_lantency) << (butil::cpuwide_time_ns() - start_ns);
+            }
+            
+            // Auto re-arm: io_uring poll is one-shot in Linux 5.10
+            // Re-register the poll immediately for continuous monitoring
+            if (fd >= 0 && !(events & EPOLLHUP)) {
+                auto mask_it = ctx->poll_mask_map.find(fd);
+                if (mask_it != ctx->poll_mask_map.end()) {
+                    uint32_t poll_mask = mask_it->second;
+                    rearm_poll(ctx, fd, event_data_id, poll_mask);
                 }
             }
-            continue;
         }
         
-        // Handle I/O event
-        if (res < 0) {
-            // Error occurred
-            if (res != -ECANCELED) {
-                VLOG(1) << "io_uring poll returned error: " << strerror(-res);
-            }
-            continue;
-        }
+        // Mark all CQEs as seen in one batch operation
+        io_uring_cq_advance(&ctx->ring, count);
         
-        IOEventDataId event_data_id = (IOEventDataId)(uintptr_t)user_data;
-        uint32_t revents = res;
-        
-        // Convert poll events to epoll-style events
-        uint32_t events = 0;
-        if (revents & POLLIN) {
-            events |= EPOLLIN;
-        }
-        if (revents & POLLOUT) {
-            events |= EPOLLOUT;
-        }
-        if (revents & POLLERR) {
-            events |= EPOLLERR;
-        }
-        if (revents & POLLHUP) {
-            events |= EPOLLHUP;
-        }
-        
-        // Call input callback if readable
-        if (events & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
-            int64_t start_ns = butil::cpuwide_time_ns();
-            CallInputEventCallback(event_data_id, events, _thread_attr);
-            (*g_edisp_read_lantency) << (butil::cpuwide_time_ns() - start_ns);
-        }
-        
-        // Call output callback if writable
-        if (events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
-            int64_t start_ns = butil::cpuwide_time_ns();
-            CallOutputEventCallback(event_data_id, events, _thread_attr);
-            (*g_edisp_write_lantency) << (butil::cpuwide_time_ns() - start_ns);
-        }
-        
-        // Note: With io_uring, poll operations are one-shot by default
-        // The application needs to re-arm the poll if continuous monitoring is needed
-        // For brpc's use case, the socket code will re-register as needed
+        // Submit any accumulated operations (re-arms, new polls, etc.)
+        // Force submit here to ensure timely re-arming
+        maybe_submit(ctx, true);
     }
 }
 
