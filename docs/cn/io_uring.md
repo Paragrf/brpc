@@ -68,6 +68,12 @@ bazel build //... --define=brpc_enable_io_uring=true
 ```bash
 # 启用io_uring
 ./your_server --use_iouring=true
+
+# 启用io_uring + SQPOLL模式（更低延迟，需要内核 >= 5.1）
+./your_server --use_iouring=true --use_iouring_sqpoll=true
+
+# 自定义SQPOLL空闲超时（毫秒，0表示永不休眠）
+./your_server --use_iouring=true --use_iouring_sqpoll=true --iouring_sqpoll_idle_ms=2000
 ```
 
 或者在代码中设置：
@@ -76,12 +82,30 @@ bazel build //... --define=brpc_enable_io_uring=true
 #include <gflags/gflags.h>
 
 DECLARE_bool(use_iouring);
+DECLARE_bool(use_iouring_sqpoll);
+DECLARE_int32(iouring_sqpoll_idle_ms);
 
 int main(int argc, char* argv[]) {
     FLAGS_use_iouring = true;
+    FLAGS_use_iouring_sqpoll = true;  // 可选：启用SQPOLL模式
+    FLAGS_iouring_sqpoll_idle_ms = 1000;  // 可选：设置空闲超时
     // ... 其他初始化代码
 }
 ```
+
+### SQPOLL 模式说明
+
+SQPOLL（Submission Queue Polling）是io_uring的一个高级特性，通过内核线程持续轮询提交队列，可以：
+
+- **完全消除提交时的系统调用**：内核线程自动处理提交队列
+- **最低延迟**：无需用户态唤醒内核
+- **更高吞吐量**：适合高并发场景
+
+**注意事项：**
+- 需要内核 >= 5.1（推荐 5.11+）
+- 每个io_uring实例会创建一个内核线程
+- 适合高吞吐量、低延迟场景
+- 如果初始化失败，会自动降级到普通模式
 
 ## 检查io_uring是否可用
 
@@ -104,6 +128,9 @@ W0000 00:00:00.000000  1234 event_dispatcher_iouring.cpp:222] io_uring not avail
 1. **内核版本**: 建议使用Linux 5.19或更高版本，包含了更多io_uring性能优化
 2. **队列深度**: 当前默认使用256个条目的队列，对于高并发场景可能需要调整
 3. **CPU亲和性**: 配合bthread的CPU亲和性设置使用效果更好
+4. **SQPOLL模式**: 对于极高吞吐量场景，可以启用`--use_iouring_sqpoll=true`，可进一步提升性能
+   - 适合：高QPS（>10K）、低延迟要求
+   - 注意：会创建内核线程，增加系统资源消耗
 
 ## 已知限制
 

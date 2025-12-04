@@ -25,8 +25,54 @@
 #include <unordered_map>
 #include "butil/fd_utility.h"
 #include "butil/logging.h"
+#include "gflags/gflags.h"
+
+DECLARE_bool(use_iouring_sqpoll);
+DECLARE_int32(iouring_sqpoll_idle_ms);
+DECLARE_bool(use_iouring_async_io);
+DECLARE_int32(iouring_async_io_threshold);
 
 namespace brpc {
+
+// Async I/O request types
+enum AsyncIOType {
+    ASYNC_IO_READ = 1,
+    ASYNC_IO_WRITE = 2
+};
+
+// Async I/O request structure
+struct AsyncIORequest {
+    AsyncIOType type;
+    int fd;
+    void* user_data;  // User callback data
+    void (*completion_cb)(void* user_data, ssize_t result, int error);  // Completion callback
+    struct iovec* iovecs;
+    int iovec_count;
+    size_t total_size;
+    
+    // For tracking
+    uint64_t request_id;
+    
+    // Memory management
+    bool owns_iovecs;  // Whether to free iovecs on destruction
+    
+    AsyncIORequest() 
+        : type(ASYNC_IO_READ)
+        , fd(-1)
+        , user_data(NULL)
+        , completion_cb(NULL)
+        , iovecs(NULL)
+        , iovec_count(0)
+        , total_size(0)
+        , request_id(0)
+        , owns_iovecs(false) {}
+    
+    ~AsyncIORequest() {
+        if (owns_iovecs && iovecs) {
+            delete[] iovecs;
+        }
+    }
+};
 
 // Check if io_uring is available on current kernel
 static bool is_io_uring_available() {
@@ -66,9 +112,117 @@ struct IOUringContext {
     // Counter for pending submissions (for batch optimization)
     int pending_submissions;
     
-    IOUringContext() : pending_submissions(0) {}
-    ~IOUringContext() {}
+    // Whether SQPOLL mode is enabled
+    bool sqpoll_enabled;
+    
+    // Async I/O support
+    bool async_io_enabled;
+    uint64_t next_async_request_id;
+    std::unordered_map<uint64_t, AsyncIORequest*> pending_async_requests;
+    
+    IOUringContext() 
+        : pending_submissions(0)
+        , sqpoll_enabled(false)
+        , async_io_enabled(false)
+        , next_async_request_id(1) {}
+    ~IOUringContext() {
+        // Clean up any pending async requests
+        for (auto& pair : pending_async_requests) {
+            delete pair.second;
+        }
+    }
 };
+
+
+// Helper function to submit async write operation
+static int submit_async_write(IOUringContext* ctx, int fd, struct iovec* iovecs,
+                              int iovec_count, void* user_data,
+                              void (*completion_cb)(void*, ssize_t, int)) {
+    if (!ctx->async_io_enabled) {
+        return -1;
+    }
+    
+    struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
+    if (!sqe) {
+        return -1;
+    }
+    
+    AsyncIORequest* req = new (std::nothrow) AsyncIORequest();
+    if (!req) {
+        return -1;
+    }
+    
+    req->type = ASYNC_IO_WRITE;
+    req->fd = fd;
+    req->user_data = user_data;
+    req->completion_cb = completion_cb;
+    req->iovecs = iovecs;
+    req->iovec_count = iovec_count;
+    req->request_id = ctx->next_async_request_id++;
+    req->owns_iovecs = false;  // Caller owns iovecs
+    
+    // Calculate total size
+    size_t total = 0;
+    for (int i = 0; i < iovec_count; i++) {
+        total += iovecs[i].iov_len;
+    }
+    req->total_size = total;
+    
+    // Prepare writev operation
+    io_uring_prep_writev(sqe, fd, iovecs, iovec_count, 0);
+    io_uring_sqe_set_data(sqe, (void*)(uintptr_t)(req->request_id | 0x8000000000000000ULL));
+    
+    ctx->pending_async_requests[req->request_id] = req;
+    ctx->pending_submissions++;
+    
+    maybe_submit(ctx, false);
+    return 0;
+}
+
+// Helper function to submit async read operation (with completion callback)
+static int submit_async_read(IOUringContext* ctx, int fd, struct iovec* iovecs, 
+                             int iovec_count, void* user_data,
+                             void (*completion_cb)(void*, ssize_t, int)) {
+    if (!ctx->async_io_enabled) {
+        return -1;
+    }
+    
+    struct io_uring_sqe* sqe = get_sqe_with_retry(ctx);
+    if (!sqe) {
+        return -1;
+    }
+    
+    AsyncIORequest* req = new (std::nothrow) AsyncIORequest();
+    if (!req) {
+        return -1;
+    }
+    
+    req->type = ASYNC_IO_READ;
+    req->fd = fd;
+    req->user_data = user_data;
+    req->completion_cb = completion_cb;
+    req->iovecs = iovecs;
+    req->iovec_count = iovec_count;
+    req->request_id = ctx->next_async_request_id++;
+    req->owns_iovecs = false;  // Caller owns iovecs
+    
+    // Calculate total size
+    size_t total = 0;
+    for (int i = 0; i < iovec_count; i++) {
+        total += iovecs[i].iov_len;
+    }
+    req->total_size = total;
+    
+    // Prepare readv operation
+    io_uring_prep_readv(sqe, fd, iovecs, iovec_count, 0);
+    io_uring_sqe_set_data(sqe, (void*)(uintptr_t)(req->request_id | 0x8000000000000000ULL));
+    
+    ctx->pending_async_requests[req->request_id] = req;
+    ctx->pending_submissions++;
+    
+    maybe_submit(ctx, false);
+    return 0;
+}
 
 EventDispatcher::EventDispatcher()
     : _event_dispatcher_fd(-1)
@@ -90,16 +244,55 @@ EventDispatcher::EventDispatcher()
     
     // Initialize io_uring with queue depth of 256
     // This is a good default for most workloads
-    int ret = io_uring_queue_init(256, &ctx->ring, 0);
+    int ret = -1;
+    
+    // Try SQPOLL mode if enabled
+    if (FLAGS_use_iouring_sqpoll) {
+        struct io_uring_params params = {};
+        params.flags |= IORING_SETUP_SQPOLL;
+        params.sq_thread_idle = FLAGS_iouring_sqpoll_idle_ms;
+        
+        ret = io_uring_queue_init_params(256, &ctx->ring, &params);
+        if (ret == 0) {
+            ctx->sqpoll_enabled = true;
+            LOG(INFO) << "io_uring initialized with SQPOLL mode (idle_ms=" 
+                      << FLAGS_iouring_sqpoll_idle_ms << ")";
+        } else {
+            // SQPOLL failed, fall back to normal mode
+            LOG(WARNING) << "Failed to initialize io_uring with SQPOLL: " 
+                        << strerror(-ret) << ", falling back to normal mode";
+            ctx->sqpoll_enabled = false;
+        }
+    }
+    
+    // Use normal mode if SQPOLL is disabled or failed
+    if (!ctx->sqpoll_enabled) {
+        ret = io_uring_queue_init(256, &ctx->ring, 0);
+    }
+    
     if (ret < 0) {
         delete ctx;
         PLOG(ERROR) << "Failed to initialize io_uring: " << strerror(-ret);
         return;
     }
     
+    // Enable async I/O if configured
+    ctx->async_io_enabled = FLAGS_use_iouring_async_io;
+    if (ctx->async_io_enabled) {
+        LOG(INFO) << "io_uring async I/O enabled (threshold=" 
+                  << FLAGS_iouring_async_io_threshold << " bytes)";
+    }
+    
     // Get the ring file descriptor for use in Stop()
     _event_dispatcher_fd = ctx->ring.ring_fd;
     _io_uring_ctx = ctx;
+    
+    // Enable async I/O if configured
+    ctx->async_io_enabled = FLAGS_use_iouring_async_io;
+    if (ctx->async_io_enabled) {
+        LOG(INFO) << "io_uring async I/O enabled (threshold=" 
+                  << FLAGS_iouring_async_io_threshold << " bytes)";
+    }
     
     _wakeup_fds[0] = -1;
     _wakeup_fds[1] = -1;
@@ -201,15 +394,38 @@ static struct io_uring_sqe* get_sqe_with_retry(IOUringContext* ctx) {
 
 // Helper function to conditionally submit based on pending count
 static void maybe_submit(IOUringContext* ctx, bool force = false) {
-    const int BATCH_THRESHOLD = 8;  // Submit when we have 8+ pending operations
-    
-    // Always submit if there are pending operations and force=true
-    // Or submit when threshold is reached
-    if (ctx->pending_submissions > 0 && 
-        (force || ctx->pending_submissions >= BATCH_THRESHOLD)) {
-        int ret = io_uring_submit(&ctx->ring);
-        if (ret >= 0) {
-            ctx->pending_submissions = 0;
+    // In SQPOLL mode, kernel thread automatically polls the submission queue
+    // We only need to explicitly submit if:
+    // 1. Force is true (e.g., during shutdown or re-arming)
+    // 2. The kernel thread might be sleeping (after idle timeout)
+    if (ctx->sqpoll_enabled) {
+        // In SQPOLL mode, we can rely on kernel polling for most cases
+        // But we still need to submit when:
+        // - Force is true (important operations)
+        // - Or when we have many pending operations (wake up kernel thread if sleeping)
+        const int SQPOLL_BATCH_THRESHOLD = 16;  // Higher threshold for SQPOLL
+        
+        if (ctx->pending_submissions > 0 && 
+            (force || ctx->pending_submissions >= SQPOLL_BATCH_THRESHOLD)) {
+            // io_uring_submit() in SQPOLL mode will wake up the kernel thread if sleeping
+            int ret = io_uring_submit(&ctx->ring);
+            if (ret >= 0) {
+                ctx->pending_submissions = 0;
+            } else if (ret != -EBUSY) {
+                // EBUSY is normal in SQPOLL mode when kernel thread is processing
+                VLOG(1) << "io_uring_submit in SQPOLL mode returned: " << strerror(-ret);
+            }
+        }
+    } else {
+        // Normal mode: submit when threshold is reached or force is true
+        const int BATCH_THRESHOLD = 8;  // Submit when we have 8+ pending operations
+        
+        if (ctx->pending_submissions > 0 && 
+            (force || ctx->pending_submissions >= BATCH_THRESHOLD)) {
+            int ret = io_uring_submit(&ctx->ring);
+            if (ret >= 0) {
+                ctx->pending_submissions = 0;
+            }
         }
     }
 }
@@ -471,7 +687,38 @@ void EventDispatcher::Run() {
                 continue;
             }
             
-            // Handle I/O event
+            // Check if this is an async I/O completion
+            // We use high bit to distinguish async I/O requests from event data IDs
+            const uintptr_t ASYNC_IO_MASK = (uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1);
+            if ((uintptr_t)user_data & ASYNC_IO_MASK) {
+                // This is an async I/O completion
+                uint64_t request_id = (uint64_t)((uintptr_t)user_data & ~ASYNC_IO_MASK);
+                auto it = ctx->pending_async_requests.find(request_id);
+                if (it != ctx->pending_async_requests.end()) {
+                    AsyncIORequest* req = it->second;
+                    ctx->pending_async_requests.erase(it);
+                    
+                    // Call completion callback
+                    if (req->completion_cb) {
+                        int error = 0;
+                        ssize_t result = res;
+                        if (res < 0) {
+                            error = -res;
+                            result = -1;
+                        }
+                        req->completion_cb(req->user_data, result, error);
+                    }
+                    
+                    // Clean up
+                    if (req->iovecs) {
+                        delete[] req->iovecs;
+                    }
+                    delete req;
+                }
+                continue;
+            }
+            
+            // Handle I/O event (poll completion)
             if (res < 0) {
                 // Error occurred
                 if (res != -ECANCELED) {
@@ -536,3 +783,33 @@ void EventDispatcher::Run() {
 }
 
 } // namespace brpc
+
+// Public API: Submit async read operation
+// Returns 0 on success, -1 on failure
+// The completion callback will be called when the operation completes
+extern "C" int brpc_io_uring_submit_async_read(int fd, struct iovec* iovecs, int iovec_count,
+                                               void* user_data,
+                                               void (*completion_cb)(void*, ssize_t, int)) {
+    using namespace brpc;
+    // Get the global event dispatcher for this fd
+    EventDispatcher& disp = GetGlobalEventDispatcher(fd, bthread_self_tag());
+    IOUringContext* ctx = static_cast<IOUringContext*>(disp._io_uring_ctx);
+    if (!ctx || !ctx->async_io_enabled) {
+        return -1;
+    }
+    return submit_async_read(ctx, fd, iovecs, iovec_count, user_data, completion_cb);
+}
+
+// Public API: Submit async write operation
+extern "C" int brpc_io_uring_submit_async_write(int fd, struct iovec* iovecs, int iovec_count,
+                                                void* user_data,
+                                                void (*completion_cb)(void*, ssize_t, int)) {
+    using namespace brpc;
+    // Get the global event dispatcher for this fd
+    EventDispatcher& disp = GetGlobalEventDispatcher(fd, bthread_self_tag());
+    IOUringContext* ctx = static_cast<IOUringContext*>(disp._io_uring_ctx);
+    if (!ctx || !ctx->async_io_enabled) {
+        return -1;
+    }
+    return submit_async_write(ctx, fd, iovecs, iovec_count, user_data, completion_cb);
+}

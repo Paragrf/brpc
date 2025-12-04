@@ -39,6 +39,16 @@ DEFINE_bool(usercode_in_coroutine, false,
 #if defined(OS_LINUX)
 DEFINE_bool(use_iouring, false,
             "Use io_uring for event dispatching instead of epoll (requires kernel >= 5.10)");
+DEFINE_bool(use_iouring_sqpoll, false,
+            "Enable io_uring SQPOLL mode for even lower latency (requires kernel >= 5.1, "
+            "creates a kernel thread per io_uring instance)");
+DEFINE_int32(iouring_sqpoll_idle_ms, 1000,
+             "Idle timeout in milliseconds for SQPOLL kernel thread (0 = never sleep)");
+DEFINE_bool(use_iouring_async_io, false,
+            "Use io_uring async I/O for read/write operations (requires kernel >= 5.1, "
+            "only effective when use_iouring=true)");
+DEFINE_int32(iouring_async_io_threshold, 65536,
+             "Minimum data size (bytes) to use async I/O, smaller operations use sync I/O");
 #endif
 
 static EventDispatcher* g_edisp = NULL;

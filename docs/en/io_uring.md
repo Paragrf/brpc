@@ -68,6 +68,12 @@ By default, even if io_uring support is enabled at compile time, the program wil
 ```bash
 # Enable io_uring
 ./your_server --use_iouring=true
+
+# Enable io_uring + SQPOLL mode (lower latency, requires kernel >= 5.1)
+./your_server --use_iouring=true --use_iouring_sqpoll=true
+
+# Customize SQPOLL idle timeout (milliseconds, 0 = never sleep)
+./your_server --use_iouring=true --use_iouring_sqpoll=true --iouring_sqpoll_idle_ms=2000
 ```
 
 Or set in code:
@@ -76,12 +82,30 @@ Or set in code:
 #include <gflags/gflags.h>
 
 DECLARE_bool(use_iouring);
+DECLARE_bool(use_iouring_sqpoll);
+DECLARE_int32(iouring_sqpoll_idle_ms);
 
 int main(int argc, char* argv[]) {
     FLAGS_use_iouring = true;
+    FLAGS_use_iouring_sqpoll = true;  // Optional: enable SQPOLL mode
+    FLAGS_iouring_sqpoll_idle_ms = 1000;  // Optional: set idle timeout
     // ... other initialization code
 }
 ```
+
+### SQPOLL Mode
+
+SQPOLL (Submission Queue Polling) is an advanced io_uring feature that uses a kernel thread to continuously poll the submission queue, which can:
+
+- **Eliminate submission system calls**: Kernel thread automatically handles the submission queue
+- **Lowest latency**: No need for userspace to wake up the kernel
+- **Higher throughput**: Suitable for high-concurrency scenarios
+
+**Notes:**
+- Requires kernel >= 5.1 (recommended 5.11+)
+- Creates one kernel thread per io_uring instance
+- Suitable for high-throughput, low-latency scenarios
+- Automatically falls back to normal mode if initialization fails
 
 ## Checking io_uring Availability
 
@@ -104,6 +128,9 @@ W0000 00:00:00.000000  1234 event_dispatcher_iouring.cpp:222] io_uring not avail
 1. **Kernel version**: Recommend using Linux 5.19 or higher, which includes more io_uring performance optimizations
 2. **Queue depth**: Currently uses a default queue of 256 entries, may need adjustment for high-concurrency scenarios
 3. **CPU affinity**: Works better when combined with bthread CPU affinity settings
+4. **SQPOLL mode**: For extremely high throughput scenarios, enable `--use_iouring_sqpoll=true` for additional performance gains
+   - Suitable for: High QPS (>10K), low latency requirements
+   - Note: Creates kernel threads, increases system resource consumption
 
 ## Known Limitations
 

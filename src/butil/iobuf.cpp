@@ -40,6 +40,10 @@
 #include "butil/fd_guard.h"                 // butil::fd_guard
 #include "butil/iobuf.h"
 #include "butil/iobuf_profiler.h"
+#ifdef BRPC_ENABLE_IO_URING
+#include "bthread/butex.h"
+#include "bthread/bthread.h"
+#endif
 
 namespace butil {
 namespace iobuf {
@@ -843,15 +847,85 @@ ssize_t IOBuf::pcut_into_file_descriptor(int fd, off_t offset, size_t size_hint)
     } while (nvec < nref && cur_len < size_hint);
 
     ssize_t nw = 0;
-
-    if (offset >= 0) {
-        static iobuf::iov_function pwritev_func = iobuf::get_pwritev_func();
-        nw = pwritev_func(fd, vec, nvec, offset);
-    } else {
-        nw = ::writev(fd, vec, nvec);
+    
+    // Try async I/O if enabled and data size exceeds threshold
+    // Note: offset must be -1 (current position) for async I/O
+    #ifdef BRPC_ENABLE_IO_URING
+    DECLARE_bool(use_iouring_async_io);
+    DECLARE_int32(iouring_async_io_threshold);
+    extern "C" int brpc_io_uring_submit_async_write(int fd, struct iovec* iovecs, int iovec_count,
+                                                    void* user_data,
+                                                    void (*completion_cb)(void*, ssize_t, int));
+    
+    if (FLAGS_use_iouring_async_io && offset < 0 && 
+        cur_len >= (size_t)FLAGS_iouring_async_io_threshold) {
+        // Use async I/O for large writes
+        struct AsyncWriteContext {
+            uint32_t* butex;
+            ssize_t result;
+            int error;
+            bool completed;
+            IOBuf* self;  // For pop_front after completion
+            
+            AsyncWriteContext() : butex(NULL), result(0), error(0), completed(false), self(NULL) {}
+        };
+        
+        AsyncWriteContext ctx;
+        ctx.butex = bthread::butex_create_checked<uint32_t>();
+        ctx.self = this;
+        *ctx.butex = 0;
+        
+        // Completion callback
+        auto completion_cb = [](void* user_data, ssize_t result, int error) {
+            AsyncWriteContext* ctx = static_cast<AsyncWriteContext*>(user_data);
+            ctx->result = result;
+            ctx->error = error;
+            ctx->completed = true;
+            if (ctx->result > 0 && ctx->self) {
+                ctx->self->pop_front(ctx->result);
+            }
+            bthread::butex_wake(ctx->butex);
+        };
+        
+        // Submit async write
+        int ret = brpc_io_uring_submit_async_write(fd, vec, nvec, &ctx, completion_cb);
+        if (ret == 0) {
+            // Wait for completion
+            bthread::butex_wait(ctx.butex, 0, NULL);
+            
+            if (ctx.completed) {
+                if (ctx.error) {
+                    errno = ctx.error;
+                    bthread::butex_destroy(ctx.butex);
+                    return -1;
+                }
+                nw = ctx.result;
+                bthread::butex_destroy(ctx.butex);
+                return nw;
+            } else {
+                // Timeout or error, fall back to sync
+                bthread::butex_destroy(ctx.butex);
+                // Fall through to sync I/O
+            }
+        } else {
+            // Async I/O not available, fall back to sync
+            bthread::butex_destroy(ctx.butex);
+            // Fall through to sync I/O
+        }
     }
-    if (nw > 0) {
-        pop_front(nw);
+    #endif
+
+    // Use sync I/O if async failed or not enabled
+    if (nw == 0) {
+        if (offset >= 0) {
+            static iobuf::iov_function pwritev_func = iobuf::get_pwritev_func();
+            nw = pwritev_func(fd, vec, nvec, offset);
+        } else {
+            nw = ::writev(fd, vec, nvec);
+        }
+        if (nw > 0) {
+            pop_front(nw);
+        }
     }
     return nw;
 }
@@ -1511,12 +1585,82 @@ ssize_t IOPortal::pappend_from_file_descriptor(
     } while (1);
 
     ssize_t nr = 0;
-    if (offset < 0) {
-        nr = readv(fd, vec, nvec);
-    } else {
-        static iobuf::iov_function preadv_func = iobuf::get_preadv_func();
-        nr = preadv_func(fd, vec, nvec, offset);
+    
+    // Try async I/O if enabled and data size exceeds threshold
+    // Note: offset must be -1 (current position) for async I/O
+    #ifdef BRPC_ENABLE_IO_URING
+    DECLARE_bool(use_iouring_async_io);
+    DECLARE_int32(iouring_async_io_threshold);
+    extern "C" int brpc_io_uring_submit_async_read(int fd, struct iovec* iovecs, int iovec_count,
+                                                   void* user_data,
+                                                   void (*completion_cb)(void*, ssize_t, int));
+    
+    if (FLAGS_use_iouring_async_io && offset < 0 && 
+        space >= (size_t)FLAGS_iouring_async_io_threshold) {
+        // Use async I/O for large reads
+        struct AsyncReadContext {
+            uint32_t* butex;
+            ssize_t result;
+            int error;
+            bool completed;
+            
+            AsyncReadContext() : butex(NULL), result(0), error(0), completed(false) {}
+        };
+        
+        AsyncReadContext ctx;
+        ctx.butex = bthread::butex_create_checked<uint32_t>();
+        *ctx.butex = 0;
+        
+        // Completion callback
+        auto completion_cb = [](void* user_data, ssize_t result, int error) {
+            AsyncReadContext* ctx = static_cast<AsyncReadContext*>(user_data);
+            ctx->result = result;
+            ctx->error = error;
+            ctx->completed = true;
+            bthread::butex_wake(ctx->butex);
+        };
+        
+        // Submit async read
+        int ret = brpc_io_uring_submit_async_read(fd, vec, nvec, &ctx, completion_cb);
+        if (ret == 0) {
+            // Wait for completion
+            bthread::butex_wait(ctx.butex, 0, NULL);
+            
+            if (ctx.completed) {
+                if (ctx.error) {
+                    errno = ctx.error;
+                    bthread::butex_destroy(ctx.butex);
+                    if (empty()) {
+                        return_cached_blocks();
+                    }
+                    return -1;
+                }
+                nr = ctx.result;
+                bthread::butex_destroy(ctx.butex);
+                // Continue to process the result below
+            } else {
+                // Timeout or error, fall back to sync
+                bthread::butex_destroy(ctx.butex);
+                // Fall through to sync I/O
+            }
+        } else {
+            // Async I/O not available, fall back to sync
+            bthread::butex_destroy(ctx.butex);
+            // Fall through to sync I/O
+        }
     }
+    #endif
+    
+    // Use sync I/O if async failed or not enabled
+    if (nr == 0) {
+        if (offset < 0) {
+            nr = readv(fd, vec, nvec);
+        } else {
+            static iobuf::iov_function preadv_func = iobuf::get_preadv_func();
+            nr = preadv_func(fd, vec, nvec, offset);
+        }
+    }
+    
     if (nr <= 0) {  // -1 or 0
         if (empty()) {
             return_cached_blocks();

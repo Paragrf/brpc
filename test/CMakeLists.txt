@@ -215,6 +215,9 @@ target_link_libraries(brpc-shared-debug ${DYNAMIC_LIB})
 if(BRPC_WITH_GLOG)
     target_link_libraries(brpc-shared-debug ${GLOG_LIB})
 endif()
+if(WITH_IO_URING)
+    target_link_libraries(brpc-shared-debug PUBLIC ${LIBURING_LIB})
+endif()
 
 # test_butil
 add_executable(test_butil ${TEST_BUTIL_SOURCES}
@@ -222,6 +225,9 @@ add_executable(test_butil ${TEST_BUTIL_SOURCES}
 target_link_libraries(test_butil brpc-shared-debug
                                  gtest
                                  ${GPERFTOOLS_LIBRARIES})
+if(WITH_IO_URING)
+    target_link_libraries(test_butil ${LIBURING_LIB})
+endif()
 
 add_test(NAME test_butil COMMAND test_butil)
 
@@ -247,6 +253,9 @@ foreach(BTHREAD_UT ${BTHREAD_UNITTESTS})
     target_link_libraries(${BTHREAD_UT_WE} gtest_main
                                            brpc-shared-debug
                                            ${GPERFTOOLS_LIBRARIES})
+    if(WITH_IO_URING)
+        target_link_libraries(${BTHREAD_UT_WE} ${LIBURING_LIB})
+    endif()
     add_test(NAME ${BTHREAD_UT_WE} COMMAND ${BTHREAD_UT_WE})
 endforeach()
 
@@ -258,6 +267,9 @@ foreach(BRPC_UT ${BRPC_UNITTESTS})
     target_link_libraries(${BRPC_UT_WE} brpc-shared-debug
                                         gtest_main
                                         ${GPERFTOOLS_LIBRARIES})
+    if(WITH_IO_URING)
+        target_link_libraries(${BRPC_UT_WE} ${LIBURING_LIB})
+    endif()
     add_test(NAME ${BRPC_UT_WE} COMMAND ${BRPC_UT_WE})
 endforeach()
 
@@ -272,6 +284,9 @@ if(BUILD_FUZZ_TESTS)
     target_link_libraries(brpc-static-debug ${DYNAMIC_LIB})
     if(BRPC_WITH_GLOG)
         target_link_libraries(brpc-static-debug ${GLOG_LIB})
+    endif()
+    if(WITH_IO_URING)
+        target_link_libraries(brpc-static-debug ${LIBURING_LIB})
     endif()
 
     set(FUZZ_TARGETS fuzz_butil fuzz_esp fuzz_hpack fuzz_http
